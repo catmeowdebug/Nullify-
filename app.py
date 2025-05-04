@@ -1,133 +1,122 @@
-import os
-import sys
 import json
+
+from flask import Flask, request, jsonify
 import requests
-import subprocess  # To open SMPlayer
+import os
+import logging
 from dotenv import load_dotenv
+from flask_cors import CORS
 import lmstudio as lms
 from ytmusicapi import YTMusic
 
+
+# Initialize Flask app
+app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 load_dotenv()
 
-# Spotify API credentials
-CLIENT_ID = "97debce860cb4f6caafe1e5f67b97a8b"
-CLIENT_SECRET = "35fa27bd5b0a48919ce00c1cd86675b5"
-REDIRECT_URI = "https://nullify-jt6x.onrender.com/callback"
-
-# Last.fm API key
-LASTFM_API_KEY = "894c8fa3285772930a82e00d410c5fd3"
+# API credentials
+CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "97debce860cb4f6caafe1e5f67b97a8b")
+CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "35fa27bd5b0a48919ce00c1cd86675b5")
+REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", "https://nullify-jt6x.onrender.com/callback")
+LASTFM_API_KEY = os.getenv("LASTFM_API_KEY", "894c8fa3285772930a82e00d410c5fd3")
 
 # Initialize YouTube Music API
-yt = YTMusic()
+try:
+    yt = YTMusic()
+except Exception as e:
+    logger.error(f"Failed to initialize YTMusic: {str(e)}")
+    yt = None
+from flask import send_file
+import tempfile
 
-# Disable symlinks warning
-os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
-print("Debug: Script started")
-print("https://nullify-jt6x.onrender.com/callback?code=AQBnfz3TLqhwfVv5gBLK0qQ4H0CRWriSb_w1PKxTNApdlDq2YVix9OyvOKPFRMXfiXPmjleXsweJi-_Ia3UcdyPfS6NHJeXkYFLsGubG5y8QA1k8eBjagTiEBbM0WSF0LF0NS7qiY4qUb0IZq4My6ye3dMbVK1IPCojkpHFnwVwsusKvI_CbG4u_HV82_0bWI_BDA28jvxL31aS6tLaoOIRStx7PWaGamC-E4QKeE52SLmFAWNq0vLuH11OyQ0jDJ3hQhZda9wi4siuGmTOggjhkU3EtdrTvU3pnxLPQCUAxgzLPYXG6AbXFtv8Z6UYYYE_X0tur-ZlzX6a4fMi3dRyZD33mLiMR4lM1ftWMSKsD7p8OQ-n3dw")
-# 1. Emotion Detection
-def detect_emotion(text):
+@app.route('/create_playlist', methods=['POST'])
+def create_playlist():
     try:
+        if not request.json or 'recommendations' not in request.json:
+            return jsonify({"error": "Missing recommendations data"}), 400
+
+        recommendations = request.json['recommendations']
+
+        # Create a temporary M3U playlist file
+        with tempfile.NamedTemporaryFile(mode='w+', suffix='.m3u', delete=False) as temp_file:
+            temp_file.write("#EXTM3U\n")
+            for track in recommendations:
+                if 'yt_link' in track:
+                    temp_file.write(f"#EXTINF:-1,{track['artist']} - {track['track']}\n")
+                    temp_file.write(f"{track['yt_link']}\n")
+
+            temp_file_path = temp_file.name
+
+        return jsonify({
+            "playlist_url": f"/download_playlist?path={temp_file_path}",
+            "message": "Playlist created successfully"
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/download_playlist')
+def download_playlist():
+    try:
+        file_path = request.args.get('path')
+        return send_file(
+            file_path,
+            as_attachment=True,
+            download_name='music_recommendations.m3u',
+            mimetype='audio/x-mpegurl'
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/')
+def health_check():
+    return jsonify({"status": "healthy", "service": "music-recommendation-api"})
+
+
+@app.route('/detect_emotion', methods=['POST'])
+def detect_emotion():
+    try:
+        if not request.json or 'text' not in request.json:
+            return jsonify({"error": "Missing text in request"}), 400
+
+        text = request.json['text']
+        logger.info(f"Detecting emotion for text: {text[:50]}...")
+
         model = lms.llm()
         chat = lms.Chat("You are an emotion detection expert. "
                         "Respond ONLY with: emotion: [label]")
-        chat.add_user_message(f"Detect the sentiment emotions wiht around maximum of 5 labels  in this text : \"{text}\"")
+        chat.add_user_message(
+            f"Detect the sentiment emotions with around maximum of 5 labels in this text: \"{text}\"")
+
         response = model.respond(chat).content.strip()
         emotion = response.split(':')[-1].strip().lower()
-        return {"emotion": emotion}
+
+        logger.info(f"Detected emotion: {emotion}")
+        return jsonify({"emotion": emotion})
+
     except Exception as e:
-        print(f"Detection Error: {str(e)}")
-        return {"emotion": "unknown"}
+        logger.error(f"Emotion detection error: {str(e)}")
+        return jsonify({"error": "Failed to detect emotion", "detail": str(e)}), 500
 
-# 2. LM Studio Tag Generation
-def generate_lastfm_tags_with_spotify(emotion, genres, country):
+
+@app.route('/get_spotify_token', methods=['POST'])
+def get_spotify_token():
     try:
-        model = lms.llm()
-        chat = lms.Chat("You are a music recommendation expert. "
-                        "Respond ONLY with a comma-separated list of emotion-related tags.")
-        prompt = f"""
-        For the emotion "{emotion}", and considering the user's favorite genres: {', '.join(genres)} 
-        and country: {country}, generate a list of 5 related emotion tags. 
-        The tags should reflect a combination of the user's emotional state, their preferred music genres, and cultural context.
-        Example: If the emotion is "happy", genres are ["hindi pop", "bollywood"], and country is "IN", the tags could be: joyful, melodious, energetic, festive, soulful.
-        """
-        chat.add_user_message(prompt)
-        response = model.respond(chat).content.strip()
-        tags = [tag.strip() for tag in response.split(",") if tag.strip()]
-        return tags if tags else []
-    except Exception as e:
-        print(f"Tag Generation Error: {str(e)}")
-        return []
+        if not request.json or 'auth_code' not in request.json:
+            return jsonify({"error": "Missing auth_code in request"}), 400
 
-# 3. Last.fm Music Search
-def search_lastfm(tags):
-    try:
-        base_url = "http://ws.audioscrobbler.com/2.0/"
-        tracks = []
+        auth_code = request.json['auth_code']
+        logger.info("Received request for Spotify token exchange")
 
-        for tag in tags:
-            params = {
-                "method": "tag.gettoptracks",
-                "tag": tag,
-                "api_key": LASTFM_API_KEY,
-                "format": "json",
-                "limit": 5
-            }
-            response = requests.get(base_url, params=params)
-            print(f"\n🔍 Debug: API response for tag '{tag}': {response.status_code}")
-            if response.status_code == 200:
-                data = response.json()
-                if "tracks" in data and "track" in data["tracks"]:
-                    for t in data["tracks"]["track"]:
-                        tracks.append({
-                            "track": t["name"],
-                            "artist": t["artist"]["name"]
-                        })
-                else:
-                    print(f"⚠ No tracks found for tag: {tag}")
-        return tracks
-    except Exception as e:
-        print(f"Last.fm Error: {str(e)}")
-        return []
-
-# 4. Fetch YouTube Music Links
-def get_ytmusic_link(track, artist):
-    results = yt.search(f"{track} {artist}")
-    for item in results:
-        if item["resultType"] == "video":
-            return f"https://music.youtube.com/watch?v={item['videoId']}"
-    return None
-
-# 5. Generate M3U Playlist
-def create_m3u_playlist(tracks, filename="playlist.m3u"):
-    try:
-        with open(filename, "w", encoding="utf-8") as file:
-            file.write("#EXTM3U\n")
-            for track in tracks:
-                yt_link = get_ytmusic_link(track["track"], track["artist"])
-                if yt_link:
-                    file.write(f"#EXTINF:-1,{track['artist']} - {track['track']}\n")
-                    file.write(f"{yt_link}\n")
-        print(f"✅ Playlist saved as {filename}")
-    except Exception as e:
-        print(f"M3U Error: {str(e)}")
-
-# 6. Play in SMPlayer
-def play_playlist_in_smplayer(filename="playlist.m3u"):
-    try:
-        choice = input("Do you want to play the playlist now in SMPlayer? (yes/no): ").strip().lower()
-        if choice == "yes":
-            smplayer_path = r"C:\Program Files\SMPlayer\smplayer.exe"  # Update this path if needed
-            subprocess.run([smplayer_path, filename], check=True)
-            print("🎵 Now playing in SMPlayer...")
-        else:
-            print("Okay, you can play it later.")
-    except Exception as e:
-        print(f"SMPlayer Error: {str(e)}")
-
-# Spotify Integration
-def get_spotify_access_token(auth_code):
-    try:
         token_url = "https://accounts.spotify.com/api/token"
         data = {
             "grant_type": "authorization_code",
@@ -136,103 +125,301 @@ def get_spotify_access_token(auth_code):
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET
         }
+
         headers = {
             "Content-Type": "application/x-www-form-urlencoded"
         }
+
+        logger.debug(f"Sending request to Spotify with data: {data}")
         response = requests.post(token_url, data=data, headers=headers)
 
-        # Debugging: Print the response details
-        print("Response Status Code:", response.status_code)
-        print("Response Body:", response.text)
+        if response.status_code != 200:
+            error_detail = response.json().get('error_description', 'No error details')
+            logger.error(f"Spotify API error: {response.status_code} - {error_detail}")
+            return jsonify({
+                "error": f"Spotify API error: {response.status_code}",
+                "detail": error_detail
+            }), response.status_code
 
-        response.raise_for_status()  # Raise an error for bad status codes
         tokens = response.json()
-        return tokens.get("access_token"), tokens.get("refresh_token")
-    except Exception as e:
-        print(f"Spotify Token Error: {str(e)}")
-        return None, None
+        logger.info("Successfully obtained Spotify tokens")
 
-def get_spotify_user_data(access_token):
+        return jsonify({
+            "access_token": tokens.get("access_token"),
+            "refresh_token": tokens.get("refresh_token"),
+            "expires_in": tokens.get("expires_in")
+        })
+
+    except Exception as e:
+        logger.error(f"Token exchange error: {str(e)}")
+        return jsonify({
+            "error": "Internal server error during token exchange",
+            "detail": str(e)
+        }), 500
+
+
+@app.route('/get_user_data', methods=['POST'])
+def get_user_data():
     try:
+        if not request.json or 'access_token' not in request.json:
+            return jsonify({"error": "Missing access_token in request"}), 400
+
+        access_token = request.json['access_token']
+        logger.info("Fetching Spotify user data")
+
         headers = {
             "Authorization": f"Bearer {access_token}"
         }
-        # Get user's top artists
-        top_artists_url = "https://api.spotify.com/v1/me/top/artists?time_range=medium_term&limit=5"
-        response = requests.get(top_artists_url, headers=headers)
-        response.raise_for_status()
-        top_artists = response.json().get("items", [])
 
-        # Extract genres from top artists
-        genres = set()
-        for artist in top_artists:
-            genres.update(artist.get("genres", []))
-
-        # Get user's country
+        # Get user profile
         user_profile_url = "https://api.spotify.com/v1/me"
         response = requests.get(user_profile_url, headers=headers)
-        response.raise_for_status()
-        country = response.json().get("country", "US")  # Default to US if not found
 
-        return {
+        if response.status_code != 200:
+            error_detail = response.json().get('error', {}).get('message', 'Unknown error')
+            logger.error(f"Spotify user profile error: {response.status_code} - {error_detail}")
+            return jsonify({
+                "error": f"Failed to get user profile: {response.status_code}",
+                "detail": error_detail
+            }), response.status_code
+
+        profile_data = response.json()
+
+        # Get top artists
+        top_artists_url = "https://api.spotify.com/v1/me/top/artists?time_range=medium_term&limit=5"
+        response = requests.get(top_artists_url, headers=headers)
+
+        top_artists = []
+        genres = set()
+
+        if response.status_code == 200:
+            top_artists = response.json().get("items", [])
+            for artist in top_artists:
+                genres.update(artist.get("genres", []))
+
+        return jsonify({
+            "user_id": profile_data.get("id"),
+            "country": profile_data.get("country", "US"),
+            "genres": list(genres),
+            "top_artists": [artist["name"] for artist in top_artists]
+        })
+
+    except Exception as e:
+        logger.error(f"User data error: {str(e)}")
+        return jsonify({
+            "error": "Failed to get user data",
+            "detail": str(e)
+        }), 500
+
+
+@app.route('/get_recommendations', methods=['POST'])
+def get_recommendations():
+    try:
+        # Validate input
+        if not request.json:
+            return jsonify({"error": "Missing request body"}), 400
+
+        if 'access_token' not in request.json:
+            return jsonify({"error": "Missing access_token"}), 400
+
+        if 'emotion' not in request.json:
+            return jsonify({"error": "Missing emotion"}), 400
+
+        access_token = request.json['access_token']
+        emotion = request.json['emotion']
+
+        logger.info(f"Starting recommendation process for emotion: {emotion}")
+
+        # Step 1: Get user data
+        headers = {"Authorization": f"Bearer {access_token}"}
+
+        # Get user profile
+        profile_url = "https://api.spotify.com/v1/me"
+        profile_response = requests.get(profile_url, headers=headers)
+
+        if profile_response.status_code != 200:
+            error = profile_response.json().get('error', {})
+            return jsonify({
+                "error": "Failed to get user profile",
+                "detail": error.get('message', 'Unknown error')
+            }), profile_response.status_code
+
+        profile_data = profile_response.json()
+        country = profile_data.get('country', 'US')
+
+        # Get top artists
+        artists_url = "https://api.spotify.com/v1/me/top/artists?time_range=medium_term&limit=5"
+        artists_response = requests.get(artists_url, headers=headers)
+
+        genres = set()
+        if artists_response.status_code == 200:
+            for artist in artists_response.json().get('items', []):
+                genres.update(artist.get('genres', []))
+
+        # Step 2: Generate emotion tags
+        model = lms.llm()
+        chat = lms.Chat("You are a music recommendation expert. "
+                        "Respond ONLY with a comma-separated list of emotion-related tags.")
+        prompt = f"""
+        For the emotion "{emotion}", and considering these genres: {', '.join(genres)} 
+        and country: {country}, generate 5 music tags.
+        Respond ONLY with comma-separated tags.
+        """
+        chat.add_user_message(prompt)
+        response = model.respond(chat).content.strip()
+        tags = [tag.strip() for tag in response.split(",") if tag.strip()]
+
+        if not tags:
+            return jsonify({"error": "Failed to generate tags"}), 500
+
+        # Step 3: Get recommendations from Last.fm
+        base_url = "http://ws.audioscrobbler.com/2.0/"
+        recommendations = []
+
+        for tag in tags[:3]:  # Limit to 3 tags to avoid too many requests
+            params = {
+                "method": "tag.gettoptracks",
+                "tag": tag,
+                "api_key": LASTFM_API_KEY,
+                "format": "json",
+                "limit": 5
+            }
+            response = requests.get(base_url, params=params)
+
+            if response.status_code == 200:
+                data = response.json()
+                tracks = data.get('tracks', {}).get('track', [])
+                for track in tracks:
+                    recommendations.append({
+                        "track": track.get('name'),
+                        "artist": track.get('artist', {}).get('name'),
+                        "tag": tag
+                    })
+
+        if not recommendations:
+            return jsonify({"error": "No tracks found for these tags"}), 404
+
+        # Step 4: Add YouTube links
+        if yt:
+            for track in recommendations[:10]:  # Limit to 10 to avoid timeout
+                try:
+                    results = yt.search(f"{track['track']} {track['artist']}")
+                    for item in results:
+                        if item["resultType"] == "video":
+                            track["yt_link"] = f"https://music.youtube.com/watch?v={item['videoId']}"
+                            break
+                except Exception as e:
+                    logger.warning(f"Couldn't get YT link for {track['track']}: {str(e)}")
+                    continue
+
+        return jsonify({
+            "recommendations": recommendations,
+            "emotion": emotion,
             "genres": list(genres),
             "country": country
-        }
-    except Exception as e:
-        print(f"Spotify API Error: {str(e)}")
-        return {
-            "genres": [],
-            "country": "US"
-        }
+        })
 
-# Main Workflow
-if __name__ == "__main__":
-    print("Debug: Starting main workflow")
+    except Exception as e:
+        logger.error(f"Recommendation error: {str(e)}")
+        return jsonify({
+            "error": "Internal server error",
+            "detail": str(e)
+        }), 500
+
+
+@app.route('/process_feedback', methods=['POST'])
+def process_feedback():
+    """Process user feedback using LM Studio and update recommendations"""
+    data = request.json
+
+    # Initialize LM Studio model
+    model = lms.llm()
+    chat = lms.Chat("""
+    You are a music recommendation assistant analyzing user feedback. 
+    Respond with JSON containing: 
+    - response: string (friendly reply)
+    - mood_adjustment: string (more_energetic|more_calm|no_change)
+    - new_tags: array (3-5 music tags based on feedback)
+    """)
+
+    # Build context for the model
+    context = f"""
+    Current mood: {data.get('current_mood')}
+    Current track: {data.get('current_track')}
+    User feedback: {data.get('feedback')}
+    Previous tags: {data.get('current_tags')}
+    """
+
+    chat.add_user_message(f"""
+    Analyze this music feedback and suggest adjustments:
+    {context}
+    """)
+
     try:
-        user_text = input("Describe your mood: ").strip()
-        if not user_text:
-            print("Error: Empty input")
-            sys.exit(1)
+        # Get structured response from LM Studio
+        result = model.respond(chat).content.strip()
+        response_data = json.loads(result)
 
-        # Step 1: Emotion Detection
-        emotion_result = detect_emotion(user_text)
-        detected_emotion = emotion_result['emotion']
-        print(f"\nDetected emotion: {detected_emotion}")
+        # Generate new recommendations based on adjusted tags
+        new_recommendations = get_recommendations_by_tags(
+            response_data['new_tags'],
+            data.get('access_token')
+        )
 
-        # Step 2: Get Spotify Access Token
-        auth_code = input("Paste your Spotify auth code here: ")
-        access_token, refresh_token = get_spotify_access_token(auth_code)
-        if not access_token:
-            print("Error: Failed to get Spotify access token")
-            sys.exit(1)
+        return jsonify({
+            "success": True,
+            "bot_response": response_data['response'],
+            "mood_adjustment": response_data['mood_adjustment'],
+            "recommendations": new_recommendations
+        })
 
-        # Step 3: Fetch Spotify User Data
-        spotify_user_data = get_spotify_user_data(access_token)
-        print("Spotify User Data:", spotify_user_data)
-
-        # Step 4: Generate Tags with Spotify Data
-        tags = generate_lastfm_tags_with_spotify(detected_emotion, spotify_user_data["genres"], spotify_user_data["country"])
-        print(f"\nRecommended tags with Spotify data: {', '.join(tags) if tags else 'None'}")
-
-        # Step 5: Music Search
-        if tags:
-            recommendations = search_lastfm(tags)
-            print("\n🎵 Music Recommendations:")
-            if recommendations:
-                for track in recommendations:
-                    print(f"- {track['track']} by {track['artist']}")
-            else:
-                print("No recommendations found.")
-
-            # Step 6: Create Playlist
-            create_m3u_playlist(recommendations)
-
-            # Step 7: Ask to Play in SMPlayer
-            play_playlist_in_smplayer()
-        else:
-            print("No valid tags generated")
-
-    except KeyboardInterrupt:
-        print("\nProcess interrupted")
     except Exception as e:
-        print(f"Critical error: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+def get_recommendations_by_tags(tags, access_token):
+    """Get recommendations based on specific tags"""
+    recommendations = []
+
+    # Get user preferences first
+    user_data = get_user_data(access_token)
+
+    for tag in tags:
+        # Combine tag with user preferences
+        search_query = f"{tag} {user_data['genres'][0]}"
+
+        # Search Last.fm
+        params = {
+            "method": "tag.gettoptracks",
+            "tag": search_query,
+            "api_key": LASTFM_API_KEY,
+            "limit": 3
+        }
+        response = requests.get("http://ws.audioscrobbler.com/2.0/", params=params)
+
+        if response.status_code == 200:
+            tracks = response.json().get('tracks', {}).get('track', [])
+            for track in tracks:
+                # Get YouTube link
+                yt_link = None
+                if yt:
+                    results = yt.search(f"{track['name']} {track['artist']['name']}")
+                    for item in results:
+                        if item["resultType"] == "video":
+                            yt_link = f"https://music.youtube.com/watch?v={item['videoId']}"
+                            break
+
+                recommendations.append({
+                    "track": track['name'],
+                    "artist": track['artist']['name'],
+                    "tag": tag,
+                    "yt_link": yt_link
+                })
+
+    return recommendations
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
